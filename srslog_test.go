@@ -3,6 +3,7 @@ package srslog
 import (
 	"bufio"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -100,7 +102,7 @@ func runStreamSyslog(l net.Listener, done chan<- string, wg *sync.WaitGroup) {
 }
 
 func startServer(n, la string, done chan<- string) (addr string, sock io.Closer, wg *sync.WaitGroup) {
-	if n == "udp" || n == "tcp" || n == "tcp+tls" {
+	if la == "" && (n == "udp" || n == "tcp" || n == "tcp+tls") {
 		la = "127.0.0.1:0"
 	} else {
 		// unix and unixgram: choose an address if none given
@@ -537,6 +539,126 @@ func TestConcurrentReconnect(t *testing.T) {
 	}
 }
 
+func TestReconnectAfterConnError(t *testing.T) {
+	crashy.Set(true)
+	defer func() { crashy.Set(false) }()
+
+	const M = 1000
+
+	net := "tcp"
+	if !testableNetwork(net) {
+		t.Skipf("skipping on %s/%s; neither 'unix' or 'tcp' is supported", runtime.GOOS, runtime.GOARCH)
+	}
+	done := make(chan string, M)
+	addr, sock, srvWG := startServer(net, "", done)
+
+	restartServer := func() {
+		sock.Close()
+		addr, sock, srvWG = startServer(net, addr, done)
+	}
+
+	// count all the messages arriving
+	count := make(chan int)
+	go func() {
+		ct := 0
+		for range done {
+			ct++
+		}
+		count <- ct
+	}()
+
+	w, err := Dial(net, addr, LOG_USER|LOG_ERR, "tag")
+	if err != nil {
+		t.Errorf("syslog.Dial() failed: %v", err)
+		return
+	}
+
+	restartServer()
+
+	for i := 0; i < M; i++ {
+		err := w.Info("test")
+		if err != nil {
+			t.Errorf("Info() failed: %v", err)
+			// return
+		}
+	}
+
+	sock.Close()
+	srvWG.Wait()
+	close(done)
+
+	select {
+	case actual := <-count:
+		if actual < M {
+			// lots of log messages are lost
+			// in buffers (kernel and/or bufio)
+			expected := M / 10
+			if actual < expected {
+				t.Errorf("From %v messages, expected %v actual %v", M, expected, actual)
+			}
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Error("timeout in concurrent reconnect")
+	}
+}
+
+func TestConcurrentReconnectAfterError(t *testing.T) {
+	crashy.Set(true)
+	defer func() { crashy.Set(false) }()
+
+	const N = 10
+	const M = 100
+
+	var dialedCount uint32
+	var receivedCount uint32
+	var sendError uint32
+	mockConn := &mockConnection{
+		writeFn: func(b []byte) (int, error) {
+			if shouldErr := atomic.AddUint32(&sendError, ^uint32(0)); shouldErr > 0 {
+				return 0, errors.New("test error")
+			}
+			written := atomic.AddUint32(&receivedCount, 1)
+			if written%M == 0 {
+				atomic.AddUint32(&sendError, 1)
+			}
+			return len(b), nil
+		},
+	}
+
+	dialFn := func(string, string) (net.Conn, error) {
+		atomic.AddUint32(&dialedCount, 1)
+		return mockConn, nil
+	}
+
+	w, err := DialWithCustomDialer("custom", "raddr", LOG_USER|LOG_ERR, "tag", dialFn)
+	if err != nil {
+		t.Fatal("Could not create writer")
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(N)
+	for i := 0; i < N; i++ {
+		go func() {
+			defer wg.Done()
+			// w.Close()
+			for i := 0; i < M; i++ {
+				err := w.Info("test")
+				if err != nil {
+					t.Errorf("Info() failed: %v", err)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	if expected := M * N; receivedCount != uint32(expected) {
+		t.Errorf("Received messages expected %v, actual %v", expected, receivedCount)
+	}
+
+	if expected := N + 1; dialedCount > uint32(expected) {
+		t.Errorf("Dial count expected MAX %v, actual %v", expected, dialedCount)
+	}
+}
 func TestLocalConn(t *testing.T) {
 	messages := make([]string, 0)
 	conn := newTestLocalConn(&messages)
