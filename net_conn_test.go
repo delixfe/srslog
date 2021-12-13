@@ -5,6 +5,8 @@ import (
 	"time"
 )
 
+var _ net.Conn = &mockConnection{}
+
 type mockConnection struct {
 	readFn  func(b []byte) (int, error)
 	writeFn func(b []byte) (int, error)
@@ -40,10 +42,6 @@ func (c *mockConnection) SetWriteDeadline(t time.Time) error { return nil }
 func (c *mockConnection) SetReadBuffer(bytes int) error { return nil }
 
 func (c *mockConnection) SetWriteBuffer(bytes int) error { return nil }
-
-func mockConnectionFullfillsNetConn() net.Conn {
-	return &mockConnection{}
-}
 
 type Addr interface {
 	Network() string // name of the network (for example, "tcp", "udp")
